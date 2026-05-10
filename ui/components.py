@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Iterable
 
 import pandas as pd
@@ -7,6 +8,9 @@ import streamlit as st
 
 import database as db
 from ui.formatters import devedor_label, format_money, safe_text
+
+
+NEW_DEVEDOR_OPTION = "➕ Novo devedor"
 
 
 def make_unique_labels(labels: list[str]) -> list[str]:
@@ -113,12 +117,6 @@ def render_table(
 def render_metric_cards(cards: Iterable[tuple[str, Any]], columns: int = 4) -> None:
     """
     Renderiza cards de métricas em colunas.
-
-    cards:
-    [
-        ("Principal aberto", "R$ 6.000,00"),
-        ("Encargos", "R$ 120,00"),
-    ]
     """
     cards_list = list(cards)
 
@@ -295,7 +293,6 @@ def ensure_devedor_foco_session() -> None:
         return
 
     devedores = db.list_devedores()
-
     st.session_state["devedor_foco_id"] = int(devedores[0]["id"]) if devedores else None
 
 
@@ -314,9 +311,82 @@ def get_devedor_foco_id() -> int | None:
     return st.session_state.get("devedor_foco_id")
 
 
-def render_devedor_foco_sidebar() -> int | None:
+def _calcular_resumo_devedor_sidebar(
+    devedor_id: int,
+    data_base: date,
+) -> dict[str, Any] | None:
+    """
+    Calcula resumo pequeno do devedor para a sidebar.
+
+    Mantido privado para evitar espalhar cálculo pesado por componentes.
+    """
+    try:
+        from calculos import calcular_carteira
+
+        resultado = calcular_carteira(
+            db.list_dividas(devedor_id=None),
+            db.list_pagamentos(devedor_id=None),
+            db.taxas_dict(),
+            db.get_settings(),
+            data_base,
+            devedor_id=devedor_id,
+        )
+
+        return resultado.get("resumo")
+    except Exception:
+        return None
+
+
+def _render_novo_devedor_sidebar_form() -> None:
+    """
+    Formulário compacto de novo devedor no sidebar.
+
+    O novo devedor é criado e imediatamente definido como devedor em foco.
+    """
+    st.caption("Cadastre um novo devedor e ele será selecionado automaticamente.")
+
+    with st.form("sidebar_form_novo_devedor"):
+        nome = st.text_input("Nome", key="sidebar_novo_devedor_nome")
+        documento = st.text_input(
+            "Documento/identificação",
+            key="sidebar_novo_devedor_documento",
+        )
+        contato = st.text_input("Contato", key="sidebar_novo_devedor_contato")
+
+        with st.expander("Observações", expanded=False):
+            observacoes = st.text_area(
+                "Observações do devedor",
+                key="sidebar_novo_devedor_observacoes",
+            )
+
+        submitted = st.form_submit_button("Cadastrar e selecionar")
+
+        if submitted:
+            if not nome.strip():
+                st.error("Informe o nome do devedor.")
+                return
+
+            devedor_id = db.add_devedor(
+                nome,
+                documento,
+                contato,
+                observacoes,
+            )
+            set_devedor_foco(devedor_id)
+            st.success("Devedor cadastrado e selecionado.")
+            st.rerun()
+
+
+def render_devedor_foco_sidebar(
+    *,
+    data_base: date | None = None,
+    show_summary: bool = False,
+) -> int | None:
     """
     Renderiza o seletor de devedor em foco na sidebar.
+
+    Inclui a opção '+ Novo devedor' dentro do próprio seletor,
+    porque devedor é uma entidade cadastral, não um lançamento financeiro.
 
     Retorna o devedor_id selecionado.
     """
@@ -326,10 +396,12 @@ def render_devedor_foco_sidebar() -> int | None:
 
     if not devedores:
         st.info("Nenhum devedor cadastrado.")
+        _render_novo_devedor_sidebar_form()
         st.session_state["devedor_foco_id"] = None
         return None
 
-    labels = make_unique_labels([devedor_label(d) for d in devedores])
+    devedor_labels = make_unique_labels([devedor_label(d) for d in devedores])
+    labels = devedor_labels + [NEW_DEVEDOR_OPTION]
 
     default_idx = 0
     foco_id = st.session_state.get("devedor_foco_id")
@@ -341,14 +413,45 @@ def render_devedor_foco_sidebar() -> int | None:
                 break
 
     escolhido = st.selectbox(
-        "Devedor em foco",
+        "Selecionar devedor",
         labels,
         index=default_idx,
         key="sidebar_devedor_foco",
     )
 
-    devedor_id = int(devedores[labels.index(escolhido)]["id"])
+    if escolhido == NEW_DEVEDOR_OPTION:
+        _render_novo_devedor_sidebar_form()
+        return st.session_state.get("devedor_foco_id")
+
+    devedor = devedores[devedor_labels.index(escolhido)]
+    devedor_id = int(devedor["id"])
     st.session_state["devedor_foco_id"] = devedor_id
+
+    if show_summary and data_base is not None:
+        resumo = _calcular_resumo_devedor_sidebar(devedor_id, data_base)
+
+        if resumo:
+            total = float(resumo.get("total_atualizado") or 0)
+            vencidos = int(resumo.get("titulos_vencidos", 0) or 0)
+            creditos = float(resumo.get("creditos_excedentes", 0) or 0)
+
+            if total <= 0.005 and creditos > 0:
+                situacao = "Com crédito"
+            elif total <= 0.005:
+                situacao = "Sem saldo em aberto"
+            elif vencidos > 0:
+                situacao = "Em atraso"
+            else:
+                situacao = "Em aberto"
+
+            st.caption(f"Situação: **{situacao}**")
+            st.metric(
+                "Total atualizado",
+                format_money(resumo.get("total_atualizado")),
+            )
+
+            if vencidos > 0:
+                st.warning(f"{vencidos} título(s) vencido(s).")
 
     return devedor_id
 

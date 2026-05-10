@@ -376,39 +376,13 @@ def titulo_tem_baixa_alocada(titulo_id: int) -> bool:
     return False
 
 
-def render_novo_devedor_form() -> None:
-    with st.form("lanc_form_novo_devedor"):
-        nome = st.text_input("Nome", key="lanc_novo_devedor_nome")
-        documento = st.text_input(
-            "Documento/identificação",
-            key="lanc_novo_devedor_documento",
-        )
-        contato = st.text_input("Contato", key="lanc_novo_devedor_contato")
-        observacoes = st.text_area(
-            "Observações",
-            key="lanc_novo_devedor_observacoes",
-        )
-
-        submitted = st.form_submit_button("Cadastrar devedor")
-
-        if submitted:
-            if not nome.strip():
-                st.error("Informe o nome.")
-                return
-
-            devedor_id = db.add_devedor(nome, documento, contato, observacoes)
-            set_devedor_foco(devedor_id)
-            st.success("Devedor cadastrado.")
-            st.rerun()
-
-
 def render_novo_titulo_form(default_devedor_id: int | None = None) -> None:
     devedores = db.list_devedores()
 
     if not devedores:
         render_empty_state(
             "Nenhum devedor cadastrado",
-            "Cadastre um devedor antes de lançar títulos.",
+            "Use a opção '+ Novo devedor' no seletor lateral para cadastrar o primeiro devedor.",
         )
         return
 
@@ -536,91 +510,93 @@ def render_novo_recebimento_form(default_devedor_id: int | None = None) -> None:
     if not devedores:
         render_empty_state(
             "Nenhum devedor cadastrado",
-            "Cadastre um devedor antes de registrar recebimentos.",
+            "Use a opção '+ Novo devedor' no seletor lateral para cadastrar o primeiro devedor.",
         )
         return
 
-    with st.form("lanc_form_novo_recebimento"):
-        labels_base = [devedor_label(d) for d in devedores]
-        labels = make_unique_labels(labels_base)
+    labels_base = [devedor_label(d) for d in devedores]
+    labels = make_unique_labels(labels_base)
 
-        default_index = 0
+    default_index = 0
 
-        if default_devedor_id is not None:
-            for i, d in enumerate(devedores):
-                if int(d["id"]) == int(default_devedor_id):
-                    default_index = i
-                    break
+    if default_devedor_id is not None:
+        for i, d in enumerate(devedores):
+            if int(d["id"]) == int(default_devedor_id):
+                default_index = i
+                break
 
-        escolhido = st.selectbox(
-            "Devedor",
-            labels,
-            index=default_index,
-            key="lanc_novo_recebimento_devedor",
+    escolhido = st.selectbox(
+        "Devedor",
+        labels,
+        index=default_index,
+        key="lanc_novo_recebimento_devedor",
+    )
+    devedor = devedores[labels.index(escolhido)]
+    devedor_id = int(devedor["id"])
+
+    modo = st.radio(
+        "Como aplicar o recebimento?",
+        ["Automático", "Automático por grupo", "Título específico"],
+        horizontal=True,
+        key="lanc_novo_recebimento_modo",
+    )
+
+    divida_id = None
+    grupo_id = None
+
+    if modo == "Automático":
+        st.caption(
+            "O recebimento será aplicado nos títulos vencidos mais antigos do devedor."
         )
-        devedor = devedores[labels.index(escolhido)]
-        devedor_id = int(devedor["id"])
 
-        modo = st.radio(
-            "Como aplicar o recebimento?",
-            ["Automático", "Automático por grupo", "Título específico"],
-            horizontal=True,
-            key="lanc_novo_recebimento_modo",
-        )
+    elif modo == "Automático por grupo":
+        grupos = db.list_grupos(devedor_id)
+        grupo_labels = [g["nome"] for g in grupos]
 
-        divida_id = None
-        grupo_id = None
-
-        if modo == "Automático":
-            st.caption(
-                "O recebimento será aplicado nos títulos vencidos mais antigos do devedor."
-            )
-
-        elif modo == "Automático por grupo":
-            grupos = db.list_grupos(devedor_id)
-            grupo_labels = [g["nome"] for g in grupos]
-
-            if not grupo_labels:
-                st.warning("Este devedor ainda não tem grupos.")
-            else:
-                grupo_escolhido = st.selectbox(
-                    "Grupo para aplicação automática",
-                    grupo_labels,
-                    key="lanc_novo_recebimento_grupo",
-                )
-                grupos_por_nome = {g["nome"]: int(g["id"]) for g in grupos}
-                grupo_id = grupos_por_nome[grupo_escolhido]
-
-            st.caption(
-                "O recebimento será aplicado no título vencido mais antigo dentro do grupo."
-            )
-
+        if not grupo_labels:
+            st.warning("Este devedor ainda não tem grupos.")
         else:
-            titulos_devedor = db.list_dividas(devedor_id=devedor_id)
+            grupo_escolhido = st.selectbox(
+                "Grupo para aplicação automática",
+                grupo_labels,
+                key="lanc_novo_recebimento_grupo",
+            )
+            grupos_por_nome = {g["nome"]: int(g["id"]) for g in grupos}
+            grupo_id = grupos_por_nome[grupo_escolhido]
 
-            if not titulos_devedor:
-                st.warning("Este devedor ainda não tem títulos abertos.")
-            else:
-                titulo_labels = [
-                    (
-                        f"{t.get('public_ref') or 'Título'} · "
-                        f"{t.get('grupo') or db.DEFAULT_GROUP_NAME} · "
-                        f"{t.get('descricao') or ''} · "
-                        f"venc. {format_date_br(t.get('data_vencimento'))} · "
-                        f"{format_money(t.get('valor_original'))}"
-                    )
-                    for t in titulos_devedor
-                ]
+        st.caption(
+            "O recebimento será aplicado no título vencido mais antigo dentro do grupo selecionado."
+        )
 
-                titulo_escolhido = st.selectbox(
-                    "Título que o recebimento deve baixar",
-                    titulo_labels,
-                    key="lanc_novo_recebimento_titulo",
+    else:
+        titulos_devedor = db.list_dividas(devedor_id=devedor_id)
+
+        if not titulos_devedor:
+            st.warning("Este devedor ainda não tem títulos abertos.")
+        else:
+            titulo_labels = [
+                (
+                    f"{t.get('public_ref') or 'Título'} · "
+                    f"{t.get('grupo') or db.DEFAULT_GROUP_NAME} · "
+                    f"{t.get('descricao') or ''} · "
+                    f"venc. {format_date_br(t.get('data_vencimento'))} · "
+                    f"{format_money(t.get('valor_original'))}"
                 )
-                divida_id = titulos_devedor[titulo_labels.index(titulo_escolhido)]["id"]
+                for t in titulos_devedor
+            ]
 
-            st.caption("O recebimento será aplicado exatamente no título selecionado.")
+            titulo_escolhido = st.selectbox(
+                "Título que o recebimento deve baixar",
+                titulo_labels,
+                key="lanc_novo_recebimento_titulo",
+            )
+            divida_id = titulos_devedor[titulo_labels.index(titulo_escolhido)]["id"]
 
+        st.caption("O recebimento será aplicado exatamente no título selecionado.")
+
+    st.divider()
+
+    with st.form("lanc_form_novo_recebimento"):
         c1, c2 = st.columns(2)
 
         with c1:
@@ -644,6 +620,7 @@ def render_novo_recebimento_form(default_devedor_id: int | None = None) -> None:
             value="PIX recebido",
             key="lanc_novo_recebimento_descricao",
         )
+
         comprovante = st.text_input(
             "Referência do comprovante/arquivo",
             key="lanc_novo_recebimento_comprovante",
@@ -1135,23 +1112,24 @@ def render_lancamentos(data_base: date) -> None:
     """
     Renderiza a página de lançamentos.
 
-    Esta página é operacional:
-    - cadastrar devedor;
+    Esta página agora concentra lançamentos financeiros:
     - cadastrar título;
     - registrar recebimento;
     - consultar/editar títulos;
     - consultar/editar recebimentos.
+
+    O cadastro de devedor fica no seletor lateral de 'Devedor em foco'.
     """
     st.subheader("Lançamentos")
 
-    default_devedor_id = st.session_state.get("devedor_foco_id")
-
-    tab_devedor, tab_titulo, tab_recebimento = st.tabs(
-        ["Novo devedor", "Novo título", "Novo recebimento"]
+    st.caption(
+        "Cadastre títulos e recebimentos. Para criar um novo devedor, use "
+        "a opção '+ Novo devedor' no seletor lateral de Devedor em foco."
     )
 
-    with tab_devedor:
-        render_novo_devedor_form()
+    default_devedor_id = st.session_state.get("devedor_foco_id")
+
+    tab_titulo, tab_recebimento = st.tabs(["Novo título", "Novo recebimento"])
 
     with tab_titulo:
         render_novo_titulo_form(default_devedor_id=default_devedor_id)
