@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
+from money import cents_to_float, format_money as money, row_money_to_cents
+
 EPSILON = 0.005
 
 
@@ -18,10 +20,6 @@ def parse_date(value: str | date) -> date:
         return date.fromisoformat(text[:10])
     except ValueError:
         return datetime.strptime(text[:10], "%Y-%m-%d").date()
-
-
-def money(v: float) -> str:
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def competencia(d: date) -> str:
@@ -73,6 +71,14 @@ def public_ref_or_fallback(row: dict[str, Any], prefix: str) -> str:
         return f"{prefix}-SEM-REF"
 
     return f"{prefix}-LEGADO-{int(row_id):06d}"
+
+
+def valor_titulo_reais(row: dict[str, Any]) -> float:
+    return cents_to_float(row_money_to_cents(row, "valor_original_centavos", "valor_original"))
+
+
+def valor_recebimento_reais(row: dict[str, Any]) -> float:
+    return cents_to_float(row_money_to_cents(row, "valor_centavos", "valor"))
 
 
 def calcular_situacao_financeira(
@@ -236,11 +242,12 @@ def calcular_carteira(
 
     for d in dividas_validas:
         venc = parse_date(d["data_vencimento"])
-        valor = float(d["valor_original"])
+        valor = valor_titulo_reais(d)
 
         estados[int(d["id"])] = {
             "id": int(d["id"]),
             "public_ref": public_ref_or_fallback(d, "TIT"),
+            "lote_ref": d.get("lote_ref") or "",
             "devedor_id": int(d["devedor_id"]),
             "devedor": d.get("devedor", ""),
             "grupo_id": d.get("grupo_id"),
@@ -316,6 +323,7 @@ def calcular_carteira(
                 "divida_id": state["id"],
                 "divida_ref": state["public_ref"],
                 "titulo_ref": state["public_ref"],
+                "lote_ref": state.get("lote_ref") or "",
                 "divida": state["descricao"],
                 "titulo": state["descricao"],
                 "valor_alocado": usado,
@@ -327,7 +335,7 @@ def calcular_carteira(
 
     for p in pagamentos_ordenados:
         data_pg = parse_date(p["data_pagamento"])
-        valor_restante = float(p["valor"])
+        valor_restante = valor_recebimento_reais(p)
 
         divida_id = p.get("divida_id")
         grupo_id = p.get("grupo_id")
@@ -390,6 +398,7 @@ def calcular_carteira(
                     "divida_id": None,
                     "divida_ref": None,
                     "titulo_ref": None,
+                    "lote_ref": None,
                     "divida": "Excedente não alocado",
                     "titulo": "Excedente não alocado",
                     "valor_alocado": -valor_restante,
@@ -447,6 +456,7 @@ def calcular_carteira(
                 "id": s["id"],
                 "public_ref": s["public_ref"],
                 "titulo_ref": s["public_ref"],
+                "lote_ref": s.get("lote_ref") or "",
                 "devedor": s["devedor"],
                 "grupo": s["grupo"],
                 "tipo": s["tipo"],
@@ -465,7 +475,7 @@ def calcular_carteira(
             }
         )
 
-    pagamentos_total = sum(float(p["valor"]) for p in pagamentos_validos)
+    pagamentos_total = sum(valor_recebimento_reais(p) for p in pagamentos_validos)
     excedente_nao_alocado = sum(
         abs(float(a["valor_alocado"]))
         for a in alocacoes

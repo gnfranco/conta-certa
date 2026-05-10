@@ -1,79 +1,154 @@
-# Cobrança IPCA + Taxa Legal
+# Conta Certa
 
-Aplicativo local em Python/Streamlit para controlar dívidas, pagamentos parciais e atualização por **IPCA + Taxa Legal**.
+Aplicativo local em Python/Streamlit para controlar títulos a receber, recebimentos parciais, atualização monetária por **IPCA + Taxa Legal** e emissão de demonstrativos.
 
-## O que ele faz
+O Conta Certa nasceu para organizar valores devidos, acompanhar atrasos, registrar pagamentos/recebimentos e manter um histórico claro para cobrança administrativa, negociação ou conferência documental.
 
-- Cadastra devedores.
-- Cadastra dívidas com vencimento, tipo e valor.
-- Registra pagamentos parciais.
-- Atualiza taxas oficiais via API SGS/BCB:
-  - IPCA mensal: série 433.
-  - Taxa Legal mensal: série 29543.
-- Calcula saldo atualizado até uma data-base.
-- Aloca pagamentos gerais automaticamente pela dívida mais antiga.
-- Exporta relatório em Excel e PDF.
-- Mantém tudo em um banco SQLite local: `data/cobrancas.db`.
+> Este projeto não substitui orientação jurídica, contábil ou financeira. Ele organiza cálculos e registros locais para apoio ao controle pessoal ou profissional.
 
-## Como instalar
+---
 
-### 1. Instale Python
+## Estado atual do projeto
 
-Use Python 3.10 ou superior.
+Esta versão representa a primeira etapa mais estruturada do Conta Certa:
 
-### 2. Crie uma pasta e descompacte o projeto
+- Interface reorganizada em módulos dentro de `ui/`.
+- Aplicativo principal (`app.py`) simplificado como roteador da interface.
+- Cadastro de devedores.
+- Cadastro de títulos a receber.
+- Registro de recebimentos.
+- Baixa automática por título mais antigo.
+- Baixa automática por grupo.
+- Baixa direcionada para título específico.
+- Correção por IPCA + Taxa Legal.
+- Uso de índices oficiais ou provisórios.
+- Exportação de demonstrativos em Excel e PDF.
+- Banco local SQLite.
+- Referências públicas profissionais para títulos, recebimentos, lotes, baixas e movimentos.
+- Camada monetária com armazenamento auxiliar em centavos.
+- Base arquitetural inspirada em sistemas contábeis para evolução futura.
 
-Exemplo:
+---
 
-```bash
-mkdir cobranca_app
-cd cobranca_app
-```
+## Principais conceitos
 
-Descompacte o ZIP dentro dessa pasta.
+### Devedor
 
-### 3. Crie ambiente virtual
+Pessoa ou empresa que deve valores.
 
-Windows PowerShell:
+Exemplos:
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
+- Cliente
+- Empresa contratante
+- Pessoa física
+- Contraparte de acordo
+- Responsável por reembolso
 
-macOS/Linux:
+### Título
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
+Valor que deveria ter sido recebido em determinada data.
 
-### 4. Instale dependências
+Exemplos:
 
-```bash
-pip install -r requirements.txt
-```
+- Mensalidade
+- Décimo terceiro
+- Férias
+- Reembolso
+- Empréstimo
+- Serviço prestado
+- Acordo antigo
 
-### 5. Rode o app
+Cada título possui:
 
-```bash
-streamlit run app.py
-```
+- Devedor
+- Grupo
+- Tipo
+- Competência
+- Descrição
+- Valor original
+- Data de vencimento
+- Status administrativo
+- Referência pública
 
-O navegador vai abrir automaticamente.
+### Recebimento
 
-## Como usar no dia a dia
+Valor recebido do devedor.
 
-1. Aba **Taxas**: clique em **Atualizar via BCB**.
-2. Aba **Devedores**: cadastre a pessoa.
-3. Aba **Dívidas**: lance cada valor devido.
-4. Aba **Pagamentos**: registre pagamentos parciais.
-5. Aba **Dashboard**: veja saldo atualizado até a data-base.
-6. Aba **Relatórios**: gere Excel/PDF para cobrança.
+O recebimento pode ser aplicado de três formas:
 
-## Observações importantes
+1. **Automático**
+   O sistema aplica o valor nos títulos vencidos mais antigos do devedor.
 
-- O app não substitui orientação jurídica.
-- Para dívidas antigas, confira se o critério de correção faz sentido no caso concreto.
-- Se uma taxa oficial ainda não saiu, o app pode usar taxa provisória marcada como tal.
-- Pagamentos sem dívida específica são alocados automaticamente da dívida vencida mais antiga para a mais nova.
+2. **Automático por grupo**
+   O sistema aplica o valor nos títulos vencidos mais antigos dentro de um grupo específico.
+
+3. **Título específico**
+   O recebimento é aplicado diretamente no título escolhido.
+
+### Grupo
+
+Organização lógica dos títulos.
+
+Exemplos:
+
+- Geral
+- Mensalidades
+- Décimo terceiro
+- Férias
+- Reembolsos
+- Empréstimos
+- Acordo antigo
+- Outros
+
+O grupo ajuda a separar dívidas por origem, contrato, período ou contexto.
+
+### Índices
+
+O sistema usa índices mensais para atualizar valores vencidos:
+
+- IPCA
+- Taxa Legal
+
+Quando o índice oficial ainda não está disponível, é possível usar valores provisórios configurados localmente.
+
+---
+
+## Referências públicas
+
+O sistema usa referências públicas para evitar expor IDs internos do banco na interface.
+
+Exemplos:
+
+- `TIT-2026-000001` para títulos
+- `REC-2026-000001` para recebimentos
+- `LOT-2026-000001` para lotes de título
+- `BXA-2026-000001` para baixas
+- `MOV-2026-000001` para movimentos
+
+Os IDs internos continuam existindo no SQLite, mas a interface prioriza referências legíveis e estáveis para o usuário.
+
+---
+
+## Estrutura do projeto
+
+```text
+conta-certa/
+├── app.py
+├── bcb.py
+├── calculos.py
+├── database.py
+├── money.py
+├── reports.py
+├── requirements.txt
+├── README.md
+├── data/
+│   └── .gitkeep
+└── ui/
+    ├── __init__.py
+    ├── components.py
+    ├── dashboard.py
+    ├── demonstrativos.py
+    ├── devedor_workspace.py
+    ├── formatters.py
+    ├── indices.py
+    └── lancamentos.py

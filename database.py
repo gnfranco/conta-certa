@@ -6,6 +6,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
+from money import cents_to_float, decimal_to_cents
+
 DB_PATH = Path(os.getenv("COBRANCA_DB", "data/cobrancas.db"))
 
 DEFAULT_GROUP_NAME = "Geral"
@@ -32,6 +34,17 @@ ADMIN_STATUSES = [
 
 REF_PREFIX_TITULO = "TIT"
 REF_PREFIX_RECEBIMENTO = "REC"
+REF_PREFIX_LOTE = "LOT"
+REF_PREFIX_BAIXA = "BXA"
+REF_PREFIX_MOVIMENTO = "MOV"
+REF_PREFIX_AJUSTE = "AJU"
+REF_PREFIX_ESTORNO = "EST"
+REF_PREFIX_CREDITO = "CRD"
+
+
+# -----------------------------------------------------------------------------
+# Infraestrutura básica
+# -----------------------------------------------------------------------------
 
 
 def connect() -> sqlite3.Connection:
@@ -207,13 +220,17 @@ def _sync_sequence_with_existing_refs_conn(
             )
 
 
+# -----------------------------------------------------------------------------
+# Migrações/backfills
+# -----------------------------------------------------------------------------
+
+
 def _backfill_public_refs_conn(conn: sqlite3.Connection) -> None:
     _sync_sequence_with_existing_refs_conn(conn, "dividas", REF_PREFIX_TITULO)
-    _sync_sequence_with_existing_refs_conn(
-        conn,
-        "pagamentos",
-        REF_PREFIX_RECEBIMENTO,
-    )
+    _sync_sequence_with_existing_refs_conn(conn, "pagamentos", REF_PREFIX_RECEBIMENTO)
+    _sync_sequence_with_existing_refs_conn(conn, "lotes_titulo", REF_PREFIX_LOTE)
+    _sync_sequence_with_existing_refs_conn(conn, "baixas", REF_PREFIX_BAIXA)
+    _sync_sequence_with_existing_refs_conn(conn, "movimentos", REF_PREFIX_MOVIMENTO)
 
     dividas = conn.execute(
         """
@@ -290,6 +307,173 @@ def _backfill_competencias_conn(conn: sqlite3.Connection) -> None:
         )
 
 
+def _backfill_centavos_conn(conn: sqlite3.Connection) -> None:
+    dividas = conn.execute(
+        """
+        SELECT id, valor_original, valor_original_centavos
+        FROM dividas
+        WHERE valor_original_centavos IS NULL
+        """
+    ).fetchall()
+
+    for d in dividas:
+        conn.execute(
+            """
+            UPDATE dividas
+            SET valor_original_centavos = ?
+            WHERE id = ?
+            """,
+            (decimal_to_cents(d["valor_original"]), int(d["id"])),
+        )
+
+    pagamentos = conn.execute(
+        """
+        SELECT id, valor, valor_centavos
+        FROM pagamentos
+        WHERE valor_centavos IS NULL
+        """
+    ).fetchall()
+
+    for p in pagamentos:
+        conn.execute(
+            """
+            UPDATE pagamentos
+            SET valor_centavos = ?
+            WHERE id = ?
+            """,
+            (decimal_to_cents(p["valor"]), int(p["id"])),
+        )
+
+
+def _get_or_create_lote_titulo_conn(
+    conn: sqlite3.Connection,
+    divida_id: int,
+) -> int:
+    row = conn.execute(
+        """
+        SELECT id
+        FROM lotes_titulo
+        WHERE divida_id = ?
+        """,
+        (divida_id,),
+    ).fetchone()
+
+    if row:
+        return int(row["id"])
+
+    divida = conn.execute(
+        """
+        SELECT id,
+               devedor_id,
+               data_vencimento,
+               valor_original,
+               valor_original_centavos,
+               status
+        FROM dividas
+        WHERE id = ?
+        """,
+        (divida_id,),
+    ).fetchone()
+
+    if not divida:
+        raise ValueError("Título não encontrado para criação de lote.")
+
+    valor_centavos = (
+        int(divida["valor_original_centavos"])
+        if divida["valor_original_centavos"] is not None
+        else decimal_to_cents(divida["valor_original"])
+    )
+
+    public_ref = _gerar_public_ref_conn(
+        conn,
+        REF_PREFIX_LOTE,
+        divida["data_vencimento"],
+    )
+
+    status_lote = "Cancelado" if divida["status"] == "Cancelada" else "Aberto"
+
+    cur = conn.execute(
+        """
+        INSERT INTO lotes_titulo(
+            public_ref,
+            divida_id,
+            devedor_id,
+            data_abertura,
+            status,
+            saldo_inicial_centavos
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            public_ref,
+            int(divida["id"]),
+            int(divida["devedor_id"]),
+            divida["data_vencimento"],
+            status_lote,
+            valor_centavos,
+        ),
+    )
+
+    return int(cur.lastrowid)
+
+
+def _ensure_lotes_for_existing_titulos_conn(conn: sqlite3.Connection) -> None:
+    dividas = conn.execute(
+        """
+        SELECT id
+        FROM dividas
+        ORDER BY data_vencimento, id
+        """
+    ).fetchall()
+
+    for d in dividas:
+        _get_or_create_lote_titulo_conn(conn, int(d["id"]))
+
+
+def _sync_lotes_com_titulos_conn(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT l.id,
+               l.divida_id,
+               d.valor_original,
+               d.valor_original_centavos,
+               d.status
+        FROM lotes_titulo l
+        JOIN dividas d ON d.id = l.divida_id
+        """
+    ).fetchall()
+
+    for row in rows:
+        valor_centavos = (
+            int(row["valor_original_centavos"])
+            if row["valor_original_centavos"] is not None
+            else decimal_to_cents(row["valor_original"])
+        )
+        status_lote = "Cancelado" if row["status"] == "Cancelada" else None
+
+        if status_lote:
+            conn.execute(
+                """
+                UPDATE lotes_titulo
+                SET saldo_inicial_centavos = ?,
+                    status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (valor_centavos, status_lote, int(row["id"])),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE lotes_titulo
+                SET saldo_inicial_centavos = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (valor_centavos, int(row["id"])),
+            )
+
+
 def _create_indexes_conn(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -298,7 +482,6 @@ def _create_indexes_conn(conn: sqlite3.Connection) -> None:
         WHERE public_ref IS NOT NULL
         """
     )
-
     conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_pagamentos_public_ref
@@ -306,27 +489,62 @@ def _create_indexes_conn(conn: sqlite3.Connection) -> None:
         WHERE public_ref IS NOT NULL
         """
     )
-
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_lotes_titulo_public_ref
+        ON lotes_titulo(public_ref)
+        WHERE public_ref IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_lotes_titulo_divida
+        ON lotes_titulo(divida_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_baixas_public_ref
+        ON baixas(public_ref)
+        WHERE public_ref IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_movimentos_public_ref
+        ON movimentos(public_ref)
+        WHERE public_ref IS NOT NULL
+        """
+    )
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_dividas_devedor_grupo
         ON dividas(devedor_id, grupo_id)
         """
     )
-
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_dividas_vencimento
         ON dividas(data_vencimento)
         """
     )
-
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_pagamentos_devedor_data
         ON pagamentos(devedor_id, data_pagamento)
         """
     )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_baixas_lote_pagamento
+        ON baixas(lote_id, pagamento_id)
+        """
+    )
+
+
+# -----------------------------------------------------------------------------
+# Grupos
+# -----------------------------------------------------------------------------
 
 
 def _get_or_create_grupo_conn(
@@ -382,6 +600,11 @@ def _ensure_default_groups_for_existing_debtors(conn: sqlite3.Connection) -> Non
         )
 
 
+# -----------------------------------------------------------------------------
+# Inicialização do banco
+# -----------------------------------------------------------------------------
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(
@@ -422,6 +645,7 @@ def init_db() -> None:
                 tipo TEXT NOT NULL DEFAULT 'Outros',
                 competencia TEXT,
                 valor_original REAL NOT NULL CHECK(valor_original >= 0),
+                valor_original_centavos INTEGER,
                 data_vencimento TEXT NOT NULL,
                 observacoes TEXT,
                 status TEXT NOT NULL DEFAULT 'Aberta',
@@ -439,6 +663,7 @@ def init_db() -> None:
                 grupo_id INTEGER,
                 data_pagamento TEXT NOT NULL,
                 valor REAL NOT NULL CHECK(valor > 0),
+                valor_centavos INTEGER,
                 descricao TEXT,
                 comprovante_ref TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -446,6 +671,85 @@ def init_db() -> None:
                 FOREIGN KEY(devedor_id) REFERENCES devedores(id) ON DELETE CASCADE,
                 FOREIGN KEY(divida_id) REFERENCES dividas(id) ON DELETE SET NULL,
                 FOREIGN KEY(grupo_id) REFERENCES grupos(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS contas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_ref TEXT,
+                parent_id INTEGER,
+                nome TEXT NOT NULL,
+                tipo TEXT NOT NULL,
+                codigo TEXT,
+                descricao TEXT,
+                ativa INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT,
+                FOREIGN KEY(parent_id) REFERENCES contas(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS movimentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_ref TEXT,
+                data_movimento TEXT NOT NULL,
+                tipo TEXT NOT NULL,
+                descricao TEXT,
+                documento_ref TEXT,
+                voided_at TEXT,
+                void_reason TEXT,
+                reversed_by_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT,
+                FOREIGN KEY(reversed_by_id) REFERENCES movimentos(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS movimento_partidas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                movimento_id INTEGER NOT NULL,
+                conta_id INTEGER,
+                valor_centavos INTEGER NOT NULL,
+                natureza TEXT NOT NULL,
+                memo TEXT,
+                divida_id INTEGER,
+                pagamento_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(movimento_id) REFERENCES movimentos(id) ON DELETE CASCADE,
+                FOREIGN KEY(conta_id) REFERENCES contas(id) ON DELETE SET NULL,
+                FOREIGN KEY(divida_id) REFERENCES dividas(id) ON DELETE SET NULL,
+                FOREIGN KEY(pagamento_id) REFERENCES pagamentos(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS lotes_titulo (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_ref TEXT,
+                divida_id INTEGER NOT NULL,
+                devedor_id INTEGER NOT NULL,
+                conta_id INTEGER,
+                data_abertura TEXT NOT NULL,
+                data_fechamento TEXT,
+                status TEXT NOT NULL DEFAULT 'Aberto',
+                saldo_inicial_centavos INTEGER NOT NULL DEFAULT 0,
+                observacoes TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT,
+                FOREIGN KEY(divida_id) REFERENCES dividas(id) ON DELETE CASCADE,
+                FOREIGN KEY(devedor_id) REFERENCES devedores(id) ON DELETE CASCADE,
+                FOREIGN KEY(conta_id) REFERENCES contas(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS baixas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_ref TEXT,
+                lote_id INTEGER NOT NULL,
+                pagamento_id INTEGER NOT NULL,
+                movimento_id INTEGER,
+                data_baixa TEXT NOT NULL,
+                valor_centavos INTEGER NOT NULL CHECK(valor_centavos > 0),
+                observacoes TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT,
+                FOREIGN KEY(lote_id) REFERENCES lotes_titulo(id) ON DELETE CASCADE,
+                FOREIGN KEY(pagamento_id) REFERENCES pagamentos(id) ON DELETE CASCADE,
+                FOREIGN KEY(movimento_id) REFERENCES movimentos(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS taxas (
@@ -468,14 +772,20 @@ def init_db() -> None:
         _add_column_if_missing(conn, "dividas", "public_ref", "TEXT")
         _add_column_if_missing(conn, "dividas", "grupo_id", "INTEGER")
         _add_column_if_missing(conn, "dividas", "competencia", "TEXT")
+        _add_column_if_missing(conn, "dividas", "valor_original_centavos", "INTEGER")
         _add_column_if_missing(conn, "dividas", "updated_at", "TEXT")
 
         _add_column_if_missing(conn, "pagamentos", "public_ref", "TEXT")
         _add_column_if_missing(conn, "pagamentos", "grupo_id", "INTEGER")
+        _add_column_if_missing(conn, "pagamentos", "valor_centavos", "INTEGER")
         _add_column_if_missing(conn, "pagamentos", "updated_at", "TEXT")
 
         _ensure_default_groups_for_existing_debtors(conn)
         _backfill_competencias_conn(conn)
+        _backfill_centavos_conn(conn)
+        _backfill_public_refs_conn(conn)
+        _ensure_lotes_for_existing_titulos_conn(conn)
+        _sync_lotes_com_titulos_conn(conn)
         _backfill_public_refs_conn(conn)
         _create_indexes_conn(conn)
 
@@ -494,6 +804,11 @@ def init_db() -> None:
             )
 
 
+# -----------------------------------------------------------------------------
+# Settings
+# -----------------------------------------------------------------------------
+
+
 def get_settings() -> dict[str, str]:
     with connect() as conn:
         rows = conn.execute("SELECT chave, valor FROM settings").fetchall()
@@ -510,6 +825,11 @@ def set_setting(chave: str, valor: str) -> None:
             """,
             (chave, valor),
         )
+
+
+# -----------------------------------------------------------------------------
+# Devedores
+# -----------------------------------------------------------------------------
 
 
 def add_devedor(
@@ -552,6 +872,11 @@ def list_devedores(apenas_ativos: bool = True) -> list[dict[str, Any]]:
 def delete_devedor(devedor_id: int) -> None:
     with connect() as conn:
         conn.execute("UPDATE devedores SET ativo = 0 WHERE id = ?", (devedor_id,))
+
+
+# -----------------------------------------------------------------------------
+# Grupos públicos
+# -----------------------------------------------------------------------------
 
 
 def get_or_create_grupo(devedor_id: int, nome: str | None) -> int:
@@ -631,6 +956,11 @@ def delete_grupo(grupo_id: int) -> None:
         )
 
 
+# -----------------------------------------------------------------------------
+# Títulos
+# -----------------------------------------------------------------------------
+
+
 def add_divida(
     devedor_id: int,
     descricao: str,
@@ -648,6 +978,9 @@ def add_divida(
                 devedor_id,
                 DEFAULT_GROUP_NAME,
             )
+
+        valor_centavos = decimal_to_cents(valor_original)
+        valor_reais = cents_to_float(valor_centavos)
 
         public_ref = _gerar_public_ref_conn(
             conn,
@@ -671,10 +1004,11 @@ def add_divida(
                 tipo,
                 competencia,
                 valor_original,
+                valor_original_centavos,
                 data_vencimento,
                 observacoes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 public_ref,
@@ -683,12 +1017,15 @@ def add_divida(
                 descricao.strip(),
                 tipo.strip(),
                 competencia_final,
-                float(valor_original),
+                valor_reais,
+                valor_centavos,
                 data_vencimento,
                 observacoes.strip(),
             ),
         )
-        return int(cur.lastrowid)
+        divida_id = int(cur.lastrowid)
+        _get_or_create_lote_titulo_conn(conn, divida_id)
+        return divida_id
 
 
 def get_divida(divida_id: int) -> dict[str, Any] | None:
@@ -698,10 +1035,13 @@ def get_divida(divida_id: int) -> dict[str, Any] | None:
             SELECT
                 d.*,
                 dev.nome AS devedor,
-                COALESCE(g.nome, 'Geral') AS grupo
+                COALESCE(g.nome, 'Geral') AS grupo,
+                l.public_ref AS lote_ref,
+                l.status AS lote_status
             FROM dividas d
             JOIN devedores dev ON dev.id = d.devedor_id
             LEFT JOIN grupos g ON g.id = d.grupo_id
+            LEFT JOIN lotes_titulo l ON l.divida_id = d.id
             WHERE d.id = ?
             """,
             (divida_id,),
@@ -717,10 +1057,13 @@ def get_divida_by_public_ref(public_ref: str) -> dict[str, Any] | None:
             SELECT
                 d.*,
                 dev.nome AS devedor,
-                COALESCE(g.nome, 'Geral') AS grupo
+                COALESCE(g.nome, 'Geral') AS grupo,
+                l.public_ref AS lote_ref,
+                l.status AS lote_status
             FROM dividas d
             JOIN devedores dev ON dev.id = d.devedor_id
             LEFT JOIN grupos g ON g.id = d.grupo_id
+            LEFT JOIN lotes_titulo l ON l.divida_id = d.id
             WHERE d.public_ref = ?
             """,
             (public_ref.strip(),),
@@ -737,10 +1080,13 @@ def list_dividas(
         SELECT
             d.*,
             dev.nome AS devedor,
-            COALESCE(g.nome, 'Geral') AS grupo
+            COALESCE(g.nome, 'Geral') AS grupo,
+            l.public_ref AS lote_ref,
+            l.status AS lote_status
         FROM dividas d
         JOIN devedores dev ON dev.id = d.devedor_id
         LEFT JOIN grupos g ON g.id = d.grupo_id
+        LEFT JOIN lotes_titulo l ON l.divida_id = d.id
         WHERE dev.ativo = 1
     """
     params: list[Any] = []
@@ -759,14 +1105,6 @@ def list_dividas(
 
 
 def count_pagamentos_diretos_divida(divida_id: int) -> int:
-    """
-    Conta recebimentos cadastrados diretamente para um título específico.
-
-    Observação:
-    recebimentos automáticos ainda são alocados dinamicamente em calculos.py.
-    Para saber se um título recebeu pagamento automático, a UI deve consultar
-    o resultado de calcular_carteira() e verificar as alocações.
-    """
     with connect() as conn:
         row = conn.execute(
             """
@@ -793,26 +1131,6 @@ def update_divida(
     competencia: str | None = None,
     permitir_alterar_valor_vencimento: bool = False,
 ) -> None:
-    """
-    Atualiza um título com trava para campos financeiros.
-
-    Campos sempre editáveis:
-    - grupo_id
-    - descricao
-    - tipo
-    - competencia
-    - observacoes
-    - status
-
-    Campos financeiros:
-    - valor_original
-    - data_vencimento
-
-    Só devem ser alterados quando permitir_alterar_valor_vencimento=True.
-
-    A UI deve passar permitir_alterar_valor_vencimento=False quando o título
-    já tiver recebimento alocado, direto ou automático.
-    """
     status_limpo = (status or "Aberta").strip()
     if status_limpo not in ADMIN_STATUSES:
         raise ValueError(
@@ -852,12 +1170,19 @@ def update_divida(
 
         if permitir_alterar_valor_vencimento:
             if valor_original is None:
-                valor_original = float(atual["valor_original"])
+                valor_original = cents_to_float(
+                    atual["valor_original_centavos"]
+                    if atual["valor_original_centavos"] is not None
+                    else decimal_to_cents(atual["valor_original"])
+                )
 
             if data_vencimento is None:
                 data_vencimento = str(atual["data_vencimento"])
 
-            if float(valor_original) < 0:
+            valor_centavos = decimal_to_cents(valor_original)
+            valor_reais = cents_to_float(valor_centavos)
+
+            if valor_centavos < 0:
                 raise ValueError("O valor original não pode ser negativo.")
 
             conn.execute(
@@ -868,6 +1193,7 @@ def update_divida(
                     tipo = ?,
                     competencia = ?,
                     valor_original = ?,
+                    valor_original_centavos = ?,
                     data_vencimento = ?,
                     observacoes = ?,
                     status = ?,
@@ -879,7 +1205,8 @@ def update_divida(
                     descricao_limpa,
                     tipo_limpo,
                     competencia_final,
-                    float(valor_original),
+                    valor_reais,
+                    valor_centavos,
                     data_vencimento,
                     observacoes_limpas,
                     status_limpo,
@@ -910,6 +1237,9 @@ def update_divida(
                 ),
             )
 
+        _get_or_create_lote_titulo_conn(conn, divida_id)
+        _sync_lotes_com_titulos_conn(conn)
+
 
 def update_divida_status(divida_id: int, status: str) -> None:
     status_limpo = (status or "Aberta").strip()
@@ -930,10 +1260,16 @@ def update_divida_status(divida_id: int, status: str) -> None:
             """,
             (status_limpo, divida_id),
         )
+        _sync_lotes_com_titulos_conn(conn)
 
 
 def delete_divida(divida_id: int) -> None:
     update_divida_status(divida_id, "Cancelada")
+
+
+# -----------------------------------------------------------------------------
+# Recebimentos
+# -----------------------------------------------------------------------------
 
 
 def add_pagamento(
@@ -949,6 +1285,11 @@ def add_pagamento(
         grupo_id = None
 
     with connect() as conn:
+        valor_centavos = decimal_to_cents(valor)
+
+        if valor_centavos <= 0:
+            raise ValueError("O valor do recebimento deve ser maior que zero.")
+
         public_ref = _gerar_public_ref_conn(
             conn,
             REF_PREFIX_RECEBIMENTO,
@@ -964,10 +1305,11 @@ def add_pagamento(
                 grupo_id,
                 data_pagamento,
                 valor,
+                valor_centavos,
                 descricao,
                 comprovante_ref
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 public_ref,
@@ -975,7 +1317,8 @@ def add_pagamento(
                 divida_id,
                 grupo_id,
                 data_pagamento,
-                float(valor),
+                cents_to_float(valor_centavos),
+                valor_centavos,
                 descricao.strip(),
                 comprovante_ref.strip(),
             ),
@@ -1064,15 +1407,9 @@ def update_pagamento(
     descricao: str = "",
     comprovante_ref: str = "",
 ) -> None:
-    """
-    Atualiza um recebimento.
+    valor_centavos = decimal_to_cents(valor)
 
-    Regra:
-    - se divida_id for informado, grupo_id fica NULL;
-    - se divida_id for NULL e grupo_id for NULL, é automático geral;
-    - se divida_id for NULL e grupo_id for informado, é automático por grupo.
-    """
-    if valor <= 0:
+    if valor_centavos <= 0:
         raise ValueError("O valor do recebimento deve ser maior que zero.")
 
     if divida_id is not None:
@@ -1095,6 +1432,7 @@ def update_pagamento(
                 grupo_id = ?,
                 data_pagamento = ?,
                 valor = ?,
+                valor_centavos = ?,
                 descricao = ?,
                 comprovante_ref = ?,
                 updated_at = CURRENT_TIMESTAMP
@@ -1105,7 +1443,8 @@ def update_pagamento(
                 divida_id,
                 grupo_id,
                 data_pagamento,
-                float(valor),
+                cents_to_float(valor_centavos),
+                valor_centavos,
                 descricao.strip(),
                 comprovante_ref.strip(),
                 pagamento_id,
@@ -1116,6 +1455,160 @@ def update_pagamento(
 def delete_pagamento(pagamento_id: int) -> None:
     with connect() as conn:
         conn.execute("DELETE FROM pagamentos WHERE id = ?", (pagamento_id,))
+
+
+# -----------------------------------------------------------------------------
+# Lotes, baixas e movimentos - base inspirada no GnuCash
+# -----------------------------------------------------------------------------
+
+
+def list_lotes_titulo(devedor_id: int | None = None) -> list[dict[str, Any]]:
+    q = """
+        SELECT
+            l.*,
+            d.public_ref AS titulo_ref,
+            d.descricao AS titulo_descricao,
+            dev.nome AS devedor
+        FROM lotes_titulo l
+        JOIN dividas d ON d.id = l.divida_id
+        JOIN devedores dev ON dev.id = l.devedor_id
+        WHERE dev.ativo = 1
+    """
+    params: list[Any] = []
+
+    if devedor_id:
+        q += " AND l.devedor_id = ?"
+        params.append(devedor_id)
+
+    q += " ORDER BY l.data_abertura, l.id"
+
+    with connect() as conn:
+        return rows_to_dicts(conn.execute(q, params).fetchall())
+
+
+def get_lote_by_divida(divida_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM lotes_titulo
+            WHERE divida_id = ?
+            """,
+            (divida_id,),
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def add_baixa(
+    lote_id: int,
+    pagamento_id: int,
+    data_baixa: str,
+    valor: float,
+    observacoes: str = "",
+    movimento_id: int | None = None,
+) -> int:
+    valor_centavos = decimal_to_cents(valor)
+
+    if valor_centavos <= 0:
+        raise ValueError("O valor da baixa deve ser maior que zero.")
+
+    with connect() as conn:
+        public_ref = _gerar_public_ref_conn(conn, REF_PREFIX_BAIXA, data_baixa)
+        cur = conn.execute(
+            """
+            INSERT INTO baixas(
+                public_ref,
+                lote_id,
+                pagamento_id,
+                movimento_id,
+                data_baixa,
+                valor_centavos,
+                observacoes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                public_ref,
+                lote_id,
+                pagamento_id,
+                movimento_id,
+                data_baixa,
+                valor_centavos,
+                observacoes.strip(),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def list_baixas(devedor_id: int | None = None) -> list[dict[str, Any]]:
+    q = """
+        SELECT
+            b.*,
+            l.public_ref AS lote_ref,
+            d.public_ref AS titulo_ref,
+            d.descricao AS titulo_descricao,
+            p.public_ref AS recebimento_ref,
+            dev.nome AS devedor
+        FROM baixas b
+        JOIN lotes_titulo l ON l.id = b.lote_id
+        JOIN dividas d ON d.id = l.divida_id
+        JOIN pagamentos p ON p.id = b.pagamento_id
+        JOIN devedores dev ON dev.id = l.devedor_id
+        WHERE dev.ativo = 1
+    """
+    params: list[Any] = []
+
+    if devedor_id:
+        q += " AND l.devedor_id = ?"
+        params.append(devedor_id)
+
+    q += " ORDER BY b.data_baixa, b.id"
+
+    with connect() as conn:
+        return rows_to_dicts(conn.execute(q, params).fetchall())
+
+
+def add_movimento(
+    data_movimento: str,
+    tipo: str,
+    descricao: str = "",
+    documento_ref: str = "",
+) -> int:
+    with connect() as conn:
+        public_ref = _gerar_public_ref_conn(conn, REF_PREFIX_MOVIMENTO, data_movimento)
+        cur = conn.execute(
+            """
+            INSERT INTO movimentos(public_ref, data_movimento, tipo, descricao, documento_ref)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                public_ref,
+                data_movimento,
+                tipo.strip(),
+                descricao.strip(),
+                documento_ref.strip(),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def list_movimentos() -> list[dict[str, Any]]:
+    with connect() as conn:
+        return rows_to_dicts(
+            conn.execute(
+                """
+                SELECT *
+                FROM movimentos
+                ORDER BY data_movimento, id
+                """
+            ).fetchall()
+        )
+
+
+# -----------------------------------------------------------------------------
+# Taxas
+# -----------------------------------------------------------------------------
 
 
 def upsert_taxa(

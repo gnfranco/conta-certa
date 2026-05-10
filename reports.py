@@ -52,6 +52,7 @@ def _titulos_rows(resultado: dict[str, Any]) -> list[dict[str, Any]]:
         rows.append(
             {
                 "Ref.": t.get("titulo_ref") or t.get("public_ref") or "",
+                "Lote": t.get("lote_ref") or "",
                 "Devedor": t.get("devedor") or "",
                 "Grupo": t.get("grupo") or "",
                 "Tipo": t.get("tipo") or "",
@@ -85,6 +86,7 @@ def _baixas_rows(resultado: dict[str, Any]) -> list[dict[str, Any]]:
                 "Devedor": b.get("devedor") or "",
                 "Grupo": b.get("grupo") or "",
                 "Título": b.get("titulo_ref") or b.get("divida_ref") or "",
+                "Lote": b.get("lote_ref") or "",
                 "Histórico": b.get("titulo") or b.get("divida") or "",
                 "Tipo": b.get("tipo_alocacao") or "Baixa",
                 "Valor alocado": _as_float(b.get("valor_alocado")),
@@ -117,54 +119,18 @@ def _resumo_rows(resultado: dict[str, Any]) -> list[dict[str, Any]]:
 
     return [
         {"Campo": "Data-base", "Valor": _format_date_br(resumo.get("data_base"))},
-        {
-            "Campo": "Total original vencido",
-            "Valor": _as_float(resumo.get("total_original_vencido")),
-        },
-        {
-            "Campo": "Recebimentos considerados",
-            "Valor": _as_float(resumo.get("pagamentos_considerados")),
-        },
-        {
-            "Campo": "Principal aberto",
-            "Valor": _as_float(resumo.get("principal_aberto_estimado")),
-        },
-        {
-            "Campo": "Encargos IPCA + Taxa Legal",
-            "Valor": _as_float(resumo.get("encargos")),
-        },
-        {
-            "Campo": "Total atualizado",
-            "Valor": _as_float(resumo.get("total_atualizado")),
-        },
-        {
-            "Campo": "Créditos/excedentes não alocados",
-            "Valor": _as_float(resumo.get("creditos_excedentes")),
-        },
-        {
-            "Campo": "Títulos vencidos",
-            "Valor": int(resumo.get("titulos_vencidos", 0) or 0),
-        },
-        {
-            "Campo": "Títulos parciais",
-            "Valor": int(resumo.get("titulos_parciais", 0) or 0),
-        },
-        {
-            "Campo": "Títulos quitados",
-            "Valor": int(resumo.get("titulos_quitados", 0) or 0),
-        },
-        {
-            "Campo": "Competências provisórias",
-            "Valor": resumo.get("competencias_provisorias") or "",
-        },
-        {
-            "Campo": "Competências faltando",
-            "Valor": resumo.get("competencias_faltando") or "",
-        },
-        {
-            "Campo": "Emitido em",
-            "Valor": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        },
+        {"Campo": "Total original vencido", "Valor": _as_float(resumo.get("total_original_vencido"))},
+        {"Campo": "Recebimentos considerados", "Valor": _as_float(resumo.get("pagamentos_considerados"))},
+        {"Campo": "Principal aberto", "Valor": _as_float(resumo.get("principal_aberto_estimado"))},
+        {"Campo": "Encargos IPCA + Taxa Legal", "Valor": _as_float(resumo.get("encargos"))},
+        {"Campo": "Total atualizado", "Valor": _as_float(resumo.get("total_atualizado"))},
+        {"Campo": "Créditos/excedentes não alocados", "Valor": _as_float(resumo.get("creditos_excedentes"))},
+        {"Campo": "Títulos vencidos", "Valor": int(resumo.get("titulos_vencidos", 0) or 0)},
+        {"Campo": "Títulos parciais", "Valor": int(resumo.get("titulos_parciais", 0) or 0)},
+        {"Campo": "Títulos quitados", "Valor": int(resumo.get("titulos_quitados", 0) or 0)},
+        {"Campo": "Competências provisórias", "Valor": resumo.get("competencias_provisorias") or ""},
+        {"Campo": "Competências faltando", "Valor": resumo.get("competencias_faltando") or ""},
+        {"Campo": "Emitido em", "Valor": datetime.now().strftime("%d/%m/%Y %H:%M:%S")},
     ]
 
 
@@ -198,7 +164,6 @@ def _apply_excel_style(writer: pd.ExcelWriter) -> None:
             col_index = col_cells[0].column
             col_letter = get_column_letter(col_index)
             header = header_by_col.get(col_index, "")
-
             max_len = 10
 
             for cell in col_cells:
@@ -209,7 +174,7 @@ def _apply_excel_style(writer: pd.ExcelWriter) -> None:
                     cell.number_format = '"R$" #,##0.00'
 
                 if header in {"IPCA (%)", "Taxa Legal (%)"} and cell.row > 1:
-                    cell.number_format = "0.0000"
+                    cell.number_format = '0.0000'
 
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
 
@@ -243,14 +208,7 @@ def gerar_pdf(
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import cm
-    from reportlab.platypus import (
-        PageBreak,
-        Paragraph,
-        SimpleDocTemplate,
-        Spacer,
-        Table,
-        TableStyle,
-    )
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     buffer = BytesIO()
 
@@ -264,21 +222,8 @@ def gerar_pdf(
     )
 
     styles = getSampleStyleSheet()
-    styles.add(
-        ParagraphStyle(
-            name="Small",
-            parent=styles["Normal"],
-            fontSize=7,
-            leading=8,
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="SmallBold",
-            parent=styles["Small"],
-            fontName="Helvetica-Bold",
-        )
-    )
+    styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontSize=7, leading=8))
+    styles.add(ParagraphStyle(name="SmallBold", parent=styles["Small"], fontName="Helvetica-Bold"))
 
     story = []
     resumo = resultado["resumo"]
@@ -327,10 +272,7 @@ def gerar_pdf(
         ]
     ]
 
-    status_table = Table(
-        status_rows,
-        colWidths=[3.2 * cm, 1.3 * cm, 3.2 * cm, 1.3 * cm, 3.2 * cm, 1.3 * cm],
-    )
+    status_table = Table(status_rows, colWidths=[3.2 * cm, 1.3 * cm, 3.2 * cm, 1.3 * cm, 3.2 * cm, 1.3 * cm])
     status_table.setStyle(
         TableStyle(
             [
@@ -349,46 +291,24 @@ def gerar_pdf(
     story.append(Spacer(1, 0.25 * cm))
 
     if resumo.get("competencias_provisorias"):
-        story.append(
-            Paragraph(
-                "Índices provisórios usados: "
-                + escape(str(resumo["competencias_provisorias"])),
-                styles["Small"],
-            )
-        )
+        story.append(Paragraph("Índices provisórios usados: " + escape(str(resumo["competencias_provisorias"])), styles["Small"]))
 
     if resumo.get("competencias_faltando"):
-        story.append(
-            Paragraph(
-                "Índices faltando: " + escape(str(resumo["competencias_faltando"])),
-                styles["Small"],
-            )
-        )
+        story.append(Paragraph("Índices faltando: " + escape(str(resumo["competencias_faltando"])), styles["Small"]))
 
     story.append(Spacer(1, 0.35 * cm))
     story.append(Paragraph("Títulos atualizados", styles["Heading2"]))
 
     titulos = _titulos_rows(resultado)
-    titulo_rows = [
-        [
-            "Ref.",
-            "Devedor",
-            "Grupo",
-            "Compet.",
-            "Venc.",
-            "Principal",
-            "Encargos",
-            "Saldo",
-            "Situação",
-        ]
-    ]
+    titulo_rows = [["Ref.", "Lote", "Devedor", "Grupo", "Compet.", "Venc.", "Principal", "Encargos", "Saldo", "Situação"]]
 
     for t in titulos:
         titulo_rows.append(
             [
                 _safe_paragraph(t["Ref."], styles["Small"]),
-                _safe_paragraph(t["Devedor"][:28], styles["Small"]),
-                _safe_paragraph(t["Grupo"][:20], styles["Small"]),
+                _safe_paragraph(t["Lote"], styles["Small"]),
+                _safe_paragraph(t["Devedor"][:25], styles["Small"]),
+                _safe_paragraph(t["Grupo"][:18], styles["Small"]),
                 _safe_paragraph(t["Competência"], styles["Small"]),
                 _safe_paragraph(t["Vencimento"], styles["Small"]),
                 money(_as_float(t["Principal aberto"])),
@@ -402,17 +322,7 @@ def gerar_pdf(
         t_titulos = Table(
             titulo_rows,
             repeatRows=1,
-            colWidths=[
-                3.1 * cm,
-                4.0 * cm,
-                3.0 * cm,
-                2.0 * cm,
-                2.1 * cm,
-                2.6 * cm,
-                2.3 * cm,
-                2.6 * cm,
-                2.6 * cm,
-            ],
+            colWidths=[2.7 * cm, 2.6 * cm, 3.3 * cm, 2.5 * cm, 1.8 * cm, 1.9 * cm, 2.4 * cm, 2.1 * cm, 2.4 * cm, 2.5 * cm],
         )
         t_titulos.setStyle(
             TableStyle(
@@ -422,7 +332,7 @@ def gerar_pdf(
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                     ("FONTSIZE", (0, 0), (-1, -1), 7),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("ALIGN", (5, 1), (7, -1), "RIGHT"),
+                    ("ALIGN", (6, 1), (8, -1), "RIGHT"),
                     ("PADDING", (0, 0), (-1, -1), 4),
                 ]
             )
@@ -435,28 +345,18 @@ def gerar_pdf(
     story.append(Paragraph("Baixas, recebimentos e excedentes", styles["Heading2"]))
 
     baixas = _baixas_rows(resultado)
-    baixa_rows = [
-        [
-            "Recebimento",
-            "Data",
-            "Devedor",
-            "Grupo",
-            "Título",
-            "Histórico",
-            "Tipo",
-            "Valor",
-        ]
-    ]
+    baixa_rows = [["Recebimento", "Data", "Devedor", "Grupo", "Título", "Lote", "Histórico", "Tipo", "Valor"]]
 
     for b in baixas:
         baixa_rows.append(
             [
                 _safe_paragraph(b["Recebimento"], styles["Small"]),
                 _safe_paragraph(b["Data"], styles["Small"]),
-                _safe_paragraph(b["Devedor"][:28], styles["Small"]),
-                _safe_paragraph(b["Grupo"][:20], styles["Small"]),
+                _safe_paragraph(b["Devedor"][:25], styles["Small"]),
+                _safe_paragraph(b["Grupo"][:18], styles["Small"]),
                 _safe_paragraph(b["Título"], styles["Small"]),
-                _safe_paragraph(b["Histórico"][:35], styles["Small"]),
+                _safe_paragraph(b["Lote"], styles["Small"]),
+                _safe_paragraph(b["Histórico"][:32], styles["Small"]),
                 _safe_paragraph(b["Tipo"], styles["Small"]),
                 money(_as_float(b["Valor alocado"])),
             ]
@@ -466,16 +366,7 @@ def gerar_pdf(
         t_baixas = Table(
             baixa_rows,
             repeatRows=1,
-            colWidths=[
-                3.2 * cm,
-                2.0 * cm,
-                4.0 * cm,
-                3.0 * cm,
-                3.2 * cm,
-                5.0 * cm,
-                2.1 * cm,
-                2.5 * cm,
-            ],
+            colWidths=[3.0 * cm, 1.8 * cm, 3.3 * cm, 2.6 * cm, 2.8 * cm, 2.6 * cm, 4.3 * cm, 2.0 * cm, 2.2 * cm],
         )
         t_baixas.setStyle(
             TableStyle(
@@ -485,16 +376,14 @@ def gerar_pdf(
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                     ("FONTSIZE", (0, 0), (-1, -1), 7),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("ALIGN", (7, 1), (7, -1), "RIGHT"),
+                    ("ALIGN", (8, 1), (8, -1), "RIGHT"),
                     ("PADDING", (0, 0), (-1, -1), 4),
                 ]
             )
         )
         story.append(t_baixas)
     else:
-        story.append(
-            Paragraph("Nenhuma baixa ou recebimento considerado.", styles["Normal"])
-        )
+        story.append(Paragraph("Nenhuma baixa ou recebimento considerado.", styles["Normal"]))
 
     story.append(Spacer(1, 0.45 * cm))
     story.append(Paragraph("Critérios do demonstrativo", styles["Heading2"]))
@@ -509,5 +398,4 @@ def gerar_pdf(
     )
 
     doc.build(story)
-
     return buffer.getvalue()
