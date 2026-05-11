@@ -49,6 +49,7 @@ def iter_month_slices(start: date, end: date):
 def str_to_bool(v: str | bool | None) -> bool:
     if isinstance(v, bool):
         return v
+
     return str(v or "").strip().lower() in {"sim", "s", "yes", "true", "1"}
 
 
@@ -74,11 +75,23 @@ def public_ref_or_fallback(row: dict[str, Any], prefix: str) -> str:
 
 
 def valor_titulo_reais(row: dict[str, Any]) -> float:
-    return cents_to_float(row_money_to_cents(row, "valor_original_centavos", "valor_original"))
+    return cents_to_float(
+        row_money_to_cents(
+            row,
+            "valor_original_centavos",
+            "valor_original",
+        )
+    )
 
 
 def valor_recebimento_reais(row: dict[str, Any]) -> float:
-    return cents_to_float(row_money_to_cents(row, "valor_centavos", "valor"))
+    return cents_to_float(
+        row_money_to_cents(
+            row,
+            "valor_centavos",
+            "valor",
+        )
+    )
 
 
 def calcular_situacao_financeira(
@@ -273,6 +286,7 @@ def calcular_carteira(
     )
 
     alocacoes: list[dict[str, Any]] = []
+    creditos: list[dict[str, Any]] = []
 
     def atualizar_divida_ate(state: dict[str, Any], ate: date) -> None:
         if state["saldo_atualizado"] <= 0:
@@ -292,15 +306,59 @@ def calcular_carteira(
         state["provisorias"].update(fr.competencias_provisorias)
         state["faltando"].update(fr.competencias_faltando)
 
+    def credito_compativel_com_titulo(
+        credito: dict[str, Any],
+        state: dict[str, Any],
+    ) -> bool:
+        if int(credito["devedor_id"]) != int(state["devedor_id"]):
+            return False
+
+        credito_grupo_id = credito.get("grupo_id")
+
+        if credito_grupo_id is None:
+            return True
+
+        return int(state.get("grupo_id") or 0) == int(credito_grupo_id)
+
+    def candidatos_para_pagamento(
+        pagamento: dict[str, Any],
+        data_pg: date,
+    ) -> list[dict[str, Any]]:
+        grupo_id = pagamento.get("grupo_id")
+        candidatos = []
+
+        for state in estados.values():
+            if state["devedor_id"] != int(pagamento["devedor_id"]):
+                continue
+
+            if state["data_vencimento"] > data_pg:
+                continue
+
+            if state["saldo_atualizado"] <= EPSILON:
+                continue
+
+            if grupo_id and int(state.get("grupo_id") or 0) != int(grupo_id):
+                continue
+
+            candidatos.append(state)
+
+        return sorted(
+            candidatos,
+            key=lambda s: (s["data_vencimento"], s["id"]),
+        )
+
     def aplicar_em_divida(
         state: dict[str, Any],
         pagamento: dict[str, Any],
         valor: float,
-        data_pg: date,
+        data_aplicacao: date,
+        *,
+        tipo_alocacao: str = "Baixa",
+        data_recebimento: date | None = None,
     ) -> float:
-        atualizar_divida_ate(state, data_pg)
+        atualizar_divida_ate(state, data_aplicacao)
 
-        if valor <= 0 or state["saldo_atualizado"] <= 0:
+        if valor <= EPSILON or state["saldo_atualizado"] <= EPSILON:
             return valor
 
         usado = min(valor, state["saldo_atualizado"])
@@ -313,28 +371,124 @@ def calcular_carteira(
             state["principal_puro"] - abatimento_principal,
         )
 
-        alocacoes.append(
-            {
-                "pagamento_id": int(pagamento["id"]),
-                "pagamento_ref": public_ref_or_fallback(pagamento, "REC"),
-                "data_pagamento": data_pg.isoformat(),
-                "devedor": state["devedor"],
-                "grupo": state["grupo"],
-                "divida_id": state["id"],
-                "divida_ref": state["public_ref"],
-                "titulo_ref": state["public_ref"],
-                "lote_ref": state.get("lote_ref") or "",
-                "divida": state["descricao"],
-                "titulo": state["descricao"],
-                "valor_alocado": usado,
-                "tipo_alocacao": "Baixa",
-            }
-        )
+        alocacao = {
+            "pagamento_id": int(pagamento["id"]),
+            "pagamento_ref": public_ref_or_fallback(pagamento, "REC"),
+            "data_pagamento": data_aplicacao.isoformat(),
+            "devedor": state["devedor"],
+            "grupo": state["grupo"],
+            "divida_id": state["id"],
+            "divida_ref": state["public_ref"],
+            "titulo_ref": state["public_ref"],
+            "lote_ref": state.get("lote_ref") or "",
+            "divida": state["descricao"],
+            "titulo": state["descricao"],
+            "valor_alocado": usado,
+            "tipo_alocacao": tipo_alocacao,
+        }
+
+        if data_recebimento is not None:
+            alocacao["data_recebimento"] = data_recebimento.isoformat()
+
+        alocacoes.append(alocacao)
 
         return valor - usado
 
+    def registrar_credito(
+        pagamento: dict[str, Any],
+        valor: float,
+        *,
+        grupo_id: int | None,
+        grupo_desc: str,
+        data_recebimento: date,
+        origem: str,
+    ) -> None:
+        if valor <= EPSILON:
+            return
+
+        creditos.append(
+            {
+                "pagamento": pagamento,
+                "pagamento_id": int(pagamento["id"]),
+                "pagamento_ref": public_ref_or_fallback(pagamento, "REC"),
+                "devedor_id": int(pagamento["devedor_id"]),
+                "devedor": pagamento.get("devedor", ""),
+                "grupo_id": grupo_id,
+                "grupo": grupo_desc,
+                "data_recebimento": data_recebimento,
+                "valor_disponivel": valor,
+                "origem": origem,
+            }
+        )
+
+    def aplicar_creditos_ate(data_limite: date) -> None:
+        """
+        Aplica créditos disponíveis em títulos compatíveis até a data limite.
+
+        Um crédito antecipado só é aplicado no vencimento do título futuro.
+        Se o crédito for posterior ao vencimento, é aplicado na data do crédito.
+        """
+        creditos.sort(
+            key=lambda c: (
+                c["data_recebimento"],
+                c["pagamento_id"],
+                str(c.get("grupo") or ""),
+            )
+        )
+
+        for credito in creditos:
+            if credito["valor_disponivel"] <= EPSILON:
+                continue
+
+            candidatos = []
+
+            for state in estados.values():
+                if state["saldo_atualizado"] <= EPSILON:
+                    continue
+
+                if not credito_compativel_com_titulo(credito, state):
+                    continue
+
+                data_aplicacao = max(
+                    credito["data_recebimento"],
+                    state["data_vencimento"],
+                )
+
+                if data_aplicacao > data_limite:
+                    continue
+
+                candidatos.append((data_aplicacao, state))
+
+            candidatos.sort(
+                key=lambda item: (
+                    item[0],
+                    item[1]["data_vencimento"],
+                    item[1]["id"],
+                )
+            )
+
+            for data_aplicacao, state in candidatos:
+                if credito["valor_disponivel"] <= EPSILON:
+                    break
+
+                credito["valor_disponivel"] = aplicar_em_divida(
+                    state,
+                    credito["pagamento"],
+                    credito["valor_disponivel"],
+                    data_aplicacao,
+                    tipo_alocacao="Crédito aplicado",
+                    data_recebimento=credito["data_recebimento"],
+                )
+
     for p in pagamentos_ordenados:
         data_pg = parse_date(p["data_pagamento"])
+
+        # Correção importante:
+        # antes de processar um recebimento novo, aplica créditos antigos
+        # disponíveis até essa data. Isso evita que um pagamento mais novo
+        # quite um título que já deveria ter sido quitado por crédito antecipado.
+        aplicar_creditos_ate(data_pg)
+
         valor_restante = valor_recebimento_reais(p)
 
         divida_id = p.get("divida_id")
@@ -349,33 +503,35 @@ def calcular_carteira(
                     p,
                     valor_restante,
                     data_pg,
+                    tipo_alocacao="Baixa",
                 )
 
+                if valor_restante > EPSILON:
+                    registrar_credito(
+                        p,
+                        valor_restante,
+                        grupo_id=state.get("grupo_id"),
+                        grupo_desc=state.get("grupo") or "Geral",
+                        data_recebimento=data_pg,
+                        origem="Excedente de título específico",
+                    )
+                    valor_restante = 0.0
+            else:
+                registrar_credito(
+                    p,
+                    valor_restante,
+                    grupo_id=None,
+                    grupo_desc="Todos os grupos",
+                    data_recebimento=data_pg,
+                    origem="Título específico não disponível na data-base",
+                )
+                valor_restante = 0.0
+
         else:
-            candidatos = []
-
-            for s in estados.values():
-                if s["devedor_id"] != int(p["devedor_id"]):
-                    continue
-
-                if s["data_vencimento"] > data_pg:
-                    continue
-
-                if s["saldo_atualizado"] <= 0:
-                    continue
-
-                if grupo_id and int(s.get("grupo_id") or 0) != int(grupo_id):
-                    continue
-
-                candidatos.append(s)
-
-            candidatos = sorted(
-                candidatos,
-                key=lambda s: (s["data_vencimento"], s["id"]),
-            )
+            candidatos = candidatos_para_pagamento(p, data_pg)
 
             for state in candidatos:
-                if valor_restante <= 0:
+                if valor_restante <= EPSILON:
                     break
 
                 valor_restante = aplicar_em_divida(
@@ -383,28 +539,58 @@ def calcular_carteira(
                     p,
                     valor_restante,
                     data_pg,
+                    tipo_alocacao="Baixa",
                 )
 
-        if valor_restante > EPSILON:
-            grupo_desc = p.get("grupo") if p.get("grupo_id") else "Todos os grupos"
+            if valor_restante > EPSILON:
+                if grupo_id:
+                    grupo_credito_id = int(grupo_id)
+                    grupo_desc = p.get("grupo") or "Grupo selecionado"
+                    origem = "Crédito antecipado por grupo"
+                else:
+                    grupo_credito_id = None
+                    grupo_desc = "Todos os grupos"
+                    origem = "Crédito antecipado geral"
 
-            alocacoes.append(
-                {
-                    "pagamento_id": int(p["id"]),
-                    "pagamento_ref": public_ref_or_fallback(p, "REC"),
-                    "data_pagamento": data_pg.isoformat(),
-                    "devedor": p.get("devedor", ""),
-                    "grupo": grupo_desc,
-                    "divida_id": None,
-                    "divida_ref": None,
-                    "titulo_ref": None,
-                    "lote_ref": None,
-                    "divida": "Excedente não alocado",
-                    "titulo": "Excedente não alocado",
-                    "valor_alocado": -valor_restante,
-                    "tipo_alocacao": "Excedente",
-                }
-            )
+                registrar_credito(
+                    p,
+                    valor_restante,
+                    grupo_id=grupo_credito_id,
+                    grupo_desc=grupo_desc,
+                    data_recebimento=data_pg,
+                    origem=origem,
+                )
+                valor_restante = 0.0
+
+        aplicar_creditos_ate(data_pg)
+
+    aplicar_creditos_ate(data_base)
+
+    for credito in creditos:
+        valor_pendente = float(credito.get("valor_disponivel") or 0.0)
+
+        if valor_pendente <= EPSILON:
+            continue
+
+        alocacoes.append(
+            {
+                "pagamento_id": int(credito["pagamento_id"]),
+                "pagamento_ref": credito["pagamento_ref"],
+                "data_pagamento": credito["data_recebimento"].isoformat(),
+                "data_recebimento": credito["data_recebimento"].isoformat(),
+                "devedor": credito.get("devedor", ""),
+                "grupo": credito.get("grupo") or "Todos os grupos",
+                "divida_id": None,
+                "divida_ref": None,
+                "titulo_ref": None,
+                "lote_ref": None,
+                "divida": "Crédito pendente",
+                "titulo": "Crédito pendente",
+                "valor_alocado": -valor_pendente,
+                "tipo_alocacao": "Crédito pendente",
+                "origem": credito.get("origem") or "",
+            }
+        )
 
     for state in estados.values():
         atualizar_divida_ate(state, data_base)
@@ -476,10 +662,12 @@ def calcular_carteira(
         )
 
     pagamentos_total = sum(valor_recebimento_reais(p) for p in pagamentos_validos)
-    excedente_nao_alocado = sum(
+
+    credito_pendente = sum(
         abs(float(a["valor_alocado"]))
         for a in alocacoes
-        if float(a["valor_alocado"]) < 0
+        if a.get("tipo_alocacao") == "Crédito pendente"
+        and float(a.get("valor_alocado") or 0) < 0
     )
 
     return {
@@ -490,8 +678,9 @@ def calcular_carteira(
             "principal_aberto_estimado": total_principal,
             "encargos": total_encargos,
             "total_atualizado": total_atualizado,
-            "excedente_nao_alocado": excedente_nao_alocado,
-            "creditos_excedentes": excedente_nao_alocado,
+            "excedente_nao_alocado": credito_pendente,
+            "creditos_excedentes": credito_pendente,
+            "creditos_pendentes": credito_pendente,
             "titulos_vencidos": total_titulos_vencidos,
             "titulos_quitados": total_titulos_quitados,
             "titulos_parciais": total_titulos_parciais,
